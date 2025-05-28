@@ -74,6 +74,30 @@ class PatternDetectionView(APIView):
             
             # Convert DataFrame to a list of dictionaries
             input_data_for_hf = df_for_hf.to_dict(orient='records')
+
+
+            # --- START TEMPORARY DEBUGGING CODE IN DJANGO BACKEND ---
+            print("\n--- DEBUGGING DATES BEING SENT TO HUGGING FACE ---")
+            for i, row_dict in enumerate(input_data_for_hf):
+                # We're specifically interested in the 'Date' column
+                if 'Date' in row_dict:
+                    date_val = row_dict['Date']
+                    print(f"Row {i}: Date='{date_val}' (Type: {type(date_val)})")
+                    # You can add more checks here if you suspect non-string types
+                    if not isinstance(date_val, str):
+                        print(f"  WARNING: Date value is not a string!")
+                    elif not date_val: # Checks for empty string or None
+                        print(f"  WARNING: Date value is empty!")
+                    elif len(date_val) != 10: # YYYY-MM-DD has 10 characters
+                        print(f"  WARNING: Date string length is not 10!")
+                    elif '-' not in date_val:
+                        print(f"  WARNING: Date string missing hyphens!")
+                else:
+                    print(f"Row {i}: 'Date' column is missing from the dictionary!")
+            print("--- END DEBUGGING DATES ---")
+            # --- END TEMPORARY DEBUGGING CODE ---
+
+
             
             # Create the payload expected by Hugging Face Inference Endpoints
             hf_payload = {"inputs": input_data_for_hf}

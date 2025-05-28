@@ -109,7 +109,7 @@ class PatternDetectionView(APIView):
                 HUGGING_FACE_API_URL,
                 headers=HF_HEADERS,
                 json=hf_payload, # requests will automatically serialize this to JSON
-                timeout=120 # Increased timeout for potential long inference times
+                timeout=300 # Increased timeout for potential long inference times
             )
 
             hf_response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)

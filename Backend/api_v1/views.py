@@ -9,6 +9,19 @@ from datetime import datetime ,timedelta
 from utils.patternLocating import locate_patterns
 import traceback
 
+import requests 
+import os       
+import json     
+
+
+HUGGING_FACE_API_URL = "https://e1khxm12hawdhhji.us-east-1.aws.endpoints.huggingface.cloud" # Example URL, update with yours
+HUGGING_FACE_API_TOKEN = os.environ.get("HUGGING_FACE_API_TOKEN")
+
+# Headers for the API request
+HF_HEADERS = {
+    "Authorization": f"Bearer {HUGGING_FACE_API_TOKEN}",
+    "Content-Type": "application/json"
+}
 
 # Create your views here.
 
@@ -20,10 +33,10 @@ class PatternDetectionView(APIView):
         response["Access-Control-Allow-Headers"] = "*"
         
         symbol = request.query_params.get('symbol', None)
-        start_date = request.query_params.get('start_date', None)
-        end_date = request.query_params.get('end_date', None)
+        start_date_str = request.query_params.get('start_date', None) # Renamed to avoid clash with datetime object
+        end_date_str = request.query_params.get('end_date', None)     # Renamed to avoid clash with datetime object
         
-        if not all([symbol, start_date, end_date]):
+        if not all([symbol, start_date_str, end_date_str]):
             return Response(
                 {"error": "Missing required parameters: symbol, start_date, end_date"},
                 status=status.HTTP_400_BAD_REQUEST
@@ -31,8 +44,9 @@ class PatternDetectionView(APIView):
         
         try:
             # Fetch data from Yahoo Finance
+            # ticker.history's 'start' and 'end' parameters are inclusive
             ticker = yf.Ticker(symbol)
-            df = ticker.history(start=start_date, end=end_date)
+            df = ticker.history(start=start_date_str, end=end_date_str) # Use string dates for yf.Ticker.history
             
             if df.empty:
                 return Response(
@@ -40,43 +54,94 @@ class PatternDetectionView(APIView):
                     status=status.HTTP_404_NOT_FOUND
                 )
             
-            # Reset index to make Date a column
+            # Reset index to make 'Date' a column
             df = df.reset_index()
             
             # Ensure 'Date' is datetime and convert to naive UTC
             df['Date'] = pd.to_datetime(df['Date'])
             if df['Date'].dt.tz is not None:
                 df['Date'] = df['Date'].dt.tz_convert('UTC').dt.tz_localize(None)
+
+            # --- Prepare data for Hugging Face Endpoint ---
+            # Your handler.py's __call__ method in the HF endpoint expects a list of dictionaries.
+            # Make sure the column names here match what your handler.py expects (e.g., 'Open', 'High', 'Low', 'Close', 'Date', 'Volume').
+            # ticker.history usually returns these capitalized.
             
-            # Call pattern detection function, disabling plotting for API calls
-            patterns_df = locate_patterns(df, plot_count=0)
+            # Format 'Date' column to 'YYYY-MM-DD' string for JSON serialization
+            df_for_hf = df.copy()
+            if 'Date' in df_for_hf.columns:
+                df_for_hf['Date'] = df_for_hf['Date'].dt.strftime('%Y-%m-%d')
             
-            if patterns_df is None or patterns_df.empty:
+            # Convert DataFrame to a list of dictionaries
+            input_data_for_hf = df_for_hf.to_dict(orient='records')
+            
+            # Create the payload expected by Hugging Face Inference Endpoints
+            hf_payload = {"inputs": input_data_for_hf}
+
+            print(f"Sending {len(input_data_for_hf)} OHLC data points to Hugging Face Endpoint.")
+
+            # --- Make the request to Hugging Face Endpoint ---
+            hf_response = requests.post(
+                HUGGING_FACE_API_URL,
+                headers=HF_HEADERS,
+                json=hf_payload, # requests will automatically serialize this to JSON
+                timeout=120 # Increased timeout for potential long inference times
+            )
+
+            hf_response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+
+            # --- Process the response from Hugging Face ---
+            # Assuming your Hugging Face model returns a list of dictionaries (your patterns)
+            patterns_dict = hf_response.json()
+            print(f"Received {len(patterns_dict)} patterns from Hugging Face Endpoint.")
+            
+            if not patterns_dict: # Check if the list is empty
                 return Response(
-                    {"message": "No patterns found for the given data."},
+                    {"message": "No patterns found by the Hugging Face model for the given data."},
                     status=status.HTTP_200_OK
                 )
+
+            # Your original code converts datetime columns in patterns_df to string.
+            # If your Hugging Face model already returns them as 'YYYY-MM-DD' strings,
+            # you might not need this loop. If it returns them as full ISO strings
+            # or epoch, you might need to re-format them here.
+            # For simplicity, I'm assuming your HF model output is already in a serializable format.
+            # If your model returns patterns_df from the original `locate_patterns`, then this conversion is still needed.
+            # Example if patterns_dict items need date re-formatting:
             
-            # Convert datetime columns to string format for serialization
+            patterns_df = pd.DataFrame(patterns_dict)
             datetime_columns = ['Start', 'End', 'Seg_Start', 'Seg_End', 'Calc_Start', 'Calc_End']
             for col in datetime_columns:
                 if col in patterns_df.columns:
                     if pd.api.types.is_datetime64_any_dtype(patterns_df[col]):
                         patterns_df[col] = pd.to_datetime(patterns_df[col]).dt.strftime('%Y-%m-%d')
-                    elif not patterns_df[col].empty and isinstance(patterns_df[col].iloc[0], str):
-                        pass
-                    else:
-                        patterns_df[col] = patterns_df[col].astype(str)
-            
-            # Convert to dictionary format
             patterns_dict = patterns_df.to_dict('records')
-            
+
+
             response = Response(patterns_dict, status=status.HTTP_200_OK)
             response["Access-Control-Allow-Origin"] = "*"
             response["Access-Control-Allow-Methods"] = "GET, OPTIONS"
             response["Access-Control-Allow-Headers"] = "*"
             return response
             
+        except requests.exceptions.RequestException as e:
+            error_message = f"Hugging Face API Error: {str(e)}\n"
+            if hasattr(e, 'response') and e.response is not None:
+                error_message += f"Status Code: {e.response.status_code}\nResponse: {e.response.text}"
+            print(error_message)
+            traceback.print_exc()
+            return Response(
+                {"error": f"Failed to get patterns from Hugging Face: {str(e)}", "detail": error_message},
+                status=status.HTTP_502_BAD_GATEWAY # 502 Bad Gateway is appropriate for upstream service errors
+            )
+        except json.JSONDecodeError as e:
+            error_message = f"JSON Decode Error from Hugging Face response: {str(e)}\nResponse Text: {hf_response.text if 'hf_response' in locals() else 'No response received'}"
+            print(error_message)
+            traceback.print_exc()
+            return Response(
+                {"error": f"Invalid JSON response from Hugging Face: {str(e)}", "detail": error_message},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
         except Exception as e:
             error_message = f"Error: {str(e)}\nTraceback: {traceback.format_exc()}"
             print(error_message)
